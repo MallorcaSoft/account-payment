@@ -15,16 +15,27 @@ class TestPaymentReturn(SavepointCase):
     def setUpClass(cls):
         super(TestPaymentReturn, cls).setUpClass()
 
+        cls.seq = cls.env['ir.sequence'].create({
+                'code': 'test_sequence_type',
+                'name': 'Test sequence',
+            })
+
+        cls.seq2 = cls.env['ir.sequence'].create({
+                'code': 'test_sequence_type2',
+                'name': 'Test sequence2',
+            })
+
         cls.journal = cls.env["account.journal"].create(
             {
                 "name": "Test Sales Journal",
                 "code": "tVEN",
                 "type": "sale",
-                "update_posted": True,
+                "restrict_mode_hash_table": False,
+                "sequence_id": cls.seq.id,
             }
         )
         cls.account_type = cls.env["account.account.type"].create(
-            {"name": "Test", "type": "receivable"}
+            {"name": "Test", "type": "receivable", "internal_group": "asset"}
         )
         cls.account = cls.env["account.account"].create(
             {
@@ -40,7 +51,8 @@ class TestPaymentReturn(SavepointCase):
                 "name": "Test Bank Journal",
                 "code": "BANK",
                 "type": "bank",
-                "update_posted": True,
+                "restrict_mode_hash_table": False,
+                "sequence_id": cls.seq2.id,
                 "default_expense_account_id": cls.account.id,
                 "default_expense_partner_id": cls.partner_expense.id,
             }
@@ -50,19 +62,20 @@ class TestPaymentReturn(SavepointCase):
                 "name": "Test income account",
                 "code": "INCOME",
                 "user_type_id": cls.env["account.account.type"]
-                .create({"name": "Test income"})
+                .create({"name": "Test income", "internal_group": "income"})
                 .id,
             }
         )
         cls.partner = cls.env["res.partner"].create({"name": "Test"})
         cls.partner_1 = cls.env["res.partner"].create({"name": "Test 1"})
-        cls.invoice = cls.env["account.invoice"].create(
+        cls.invoice = cls.env["account.move"].create(
             {
+                "type": "out_invoice",
                 "journal_id": cls.journal.id,
-                "account_id": cls.account.id,
                 "company_id": cls.env.user.company_id.id,
                 "currency_id": cls.env.user.company_id.currency_id.id,
                 "partner_id": cls.partner.id,
+                "invoice_date": '2019-01-05',
                 "invoice_line_ids": [
                     (
                         0,
@@ -72,6 +85,7 @@ class TestPaymentReturn(SavepointCase):
                             "name": "Test line",
                             "price_unit": 50,
                             "quantity": 10,
+                            'tax_ids': [(6, 0, [])],
                         },
                     )
                 ],
@@ -80,12 +94,16 @@ class TestPaymentReturn(SavepointCase):
         cls.reason = cls.env["payment.return.reason"].create(
             {"code": "RTEST", "name": "Reason Test"}
         )
-        cls.invoice.action_invoice_open()
-        cls.receivable_line = cls.invoice.move_id.line_ids.filtered(
+
+        import wdb
+        wdb.set_trace()
+
+        cls.invoice.post()
+        cls.receivable_line = cls.invoice.line_ids.filtered(
             lambda x: x.account_id.internal_type == "receivable"
         )
         # Invert the move to simulate the payment
-        cls.payment_move = cls.invoice.move_id.copy({"journal_id": cls.bank_journal.id})
+        cls.payment_move = cls.invoice.copy({"journal_id": cls.bank_journal.id})
         for move_line in cls.payment_move.line_ids:
             move_line.with_context(check_move_validity=False).write(
                 {"debit": move_line.credit, "credit": move_line.debit}
@@ -130,7 +148,7 @@ class TestPaymentReturn(SavepointCase):
 
     def test_payment_return(self):
         self.payment_return.action_cancel()  # No effect
-        self.assertEqual(self.invoice.state, "paid")
+        self.assertEqual(self.invoice.invoice_payment_state, "paid")
         self.assertEqual(self.payment_return.state, "cancelled")
         self.payment_return.action_draft()
         self.assertEqual(self.payment_return.state, "draft")
@@ -154,14 +172,14 @@ class TestPaymentReturn(SavepointCase):
             self.payment_return.unlink()
         self.payment_return.action_cancel()
         self.assertEqual(self.payment_return.state, "cancelled")
-        self.assertEqual(self.invoice.state, "paid")
+        self.assertEqual(self.invoice.invoice_payment_state, "paid")
         self.assertTrue(self.receivable_line.reconciled)
         self.payment_return.action_draft()
         self.assertEqual(self.payment_return.state, "draft")
         self.payment_return.unlink()
 
     def test_payment_return_auto_reconcile(self):
-        self.assertEqual(self.invoice.state, "paid")
+        self.assertEqual(self.invoice.invoice_payment_state, "paid")
         self.payment_return.action_draft()
         self.payment_return.line_ids[0].expense_amount = 20.0
         self.payment_return.line_ids[0]._onchange_expense_amount()
@@ -176,13 +194,13 @@ class TestPaymentReturn(SavepointCase):
 
     def test_payment_partial_return(self):
         self.payment_return.line_ids[0].amount = 500.0
-        self.assertEqual(self.invoice.state, "paid")
+        self.assertEqual(self.invoice.invoice_payment_state, "paid")
         self.payment_return.action_confirm()
         self.assertEqual(self.invoice.state, "open")
         self.assertEqual(self.invoice.residual, 500.0)
         self.assertFalse(self.receivable_line.reconciled)
         self.payment_return.action_cancel()
-        self.assertEqual(self.invoice.state, "paid")
+        self.assertEqual(self.invoice.invoice_payment_state, "paid")
         self.assertTrue(self.receivable_line.reconciled)
 
     def test_find_match_invoice(self):
@@ -289,10 +307,10 @@ class TestPaymentReturn(SavepointCase):
             )
 
     def test_payments_widget(self):
-        info = json.loads(self.invoice.payments_widget)
+        info = json.loads(self.invoice.invoice_payments_widget)
         self.assertEqual(len(info["content"]), 1)
         self.payment_return.action_confirm()
-        info = json.loads(self.invoice.payments_widget)
+        info = json.loads(self.invoice.invoice_payments_widget)
         self.assertEqual(len(info["content"]), 2)
         self.assertEqual(info["content"][1]["amount"], -500.0)
 
